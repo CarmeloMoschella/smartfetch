@@ -1,0 +1,28 @@
+{
+  "name": "smartfetch",
+  "version": "0.1.0",
+  "description": "Wrapper avanzado sobre fetch: timeouts, reintentos automáticos y una interfaz limpia, sin dependencias de terceros.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "jest",
+    "test:watch": "jest --watch"
+  },
+  "keywords": [
+    "fetch",
+    "http-client",
+    "typescript"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.11.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.2",
+    "typescript": "^5.4.0"
+  }
+}
