@@ -34,12 +34,7 @@ export async function withTimeout(
     clearTimeout(timeoutId);
     
     if (error.name === 'AbortError') {
-      const timeoutError = new Error('La petición ha excedido el tiempo de espera');
-      timeoutError.name = 'SmartFetchError';
-      (timeoutError as any).isTimeout = true;
-
-      
-      throw timeoutError;
+      throw new SmartFetchError('La petición ha excedido el tiempo de espera', undefined, true);
     }
     
     throw error;
