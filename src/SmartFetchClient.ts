@@ -4,15 +4,26 @@ import {
   SmartFetchConfig,
   SmartFetchError,
   SmartFetchResponse,
+  InternalRequestConfig,
 } from './types';
 import { withTimeout } from './timeout';
 import { withRetry } from './retry';
+import { InterceptorManager } from './interceptors';
+import { RequestDeduplicator } from './dedupe';
+import { ResponseCache } from './cache';
 
 /**
  * Cliente HTTP de alto nivel construido sobre fetch.
  */
 export class SmartFetchClient {
   private readonly config: SmartFetchConfig;
+  private readonly deduplicator = new RequestDeduplicator();
+  public readonly cache = new ResponseCache();
+
+  public readonly interceptors = {
+    request: new InterceptorManager<InternalRequestConfig>(),
+    response: new InterceptorManager<SmartFetchResponse<any>>(),
+  };
 
   constructor(config: SmartFetchConfig = {}) {
     this.config = {
@@ -111,22 +122,157 @@ export class SmartFetchClient {
     url: string,
     config: RequestConfig = {}
   ): Promise<SmartFetchResponse<T>> {
-    const timeout = config.timeout ?? this.config.timeout ?? 0;
-    const retries = config.retries ?? this.config.retries ?? 0;
-    const fullUrl = this.buildUrl(url, config.params);
-    const headers: Record<string, string> = {
-      ...this.config.headers,
-      ...config.headers,
+    const initialConfig: InternalRequestConfig = {
+      ...config,
+      url,
+      method,
+      headers: {
+        ...this.config.headers,
+        ...config.headers,
+      },
+      params: config.params ?? {},
+      timeout: config.timeout ?? this.config.timeout ?? 0,
+      retries: config.retries ?? this.config.retries ?? 0,
+      dedupe: config.dedupe ?? this.config.dedupe ?? (method === 'GET'),
+      cacheTime: config.cacheTime ?? this.config.cacheTime ?? 0,
+      staleWhileRevalidate: config.staleWhileRevalidate ?? this.config.staleWhileRevalidate ?? false,
     };
 
-    const hasBody = config.body !== undefined && method !== 'GET' && method !== 'DELETE';
+    // Armar cadena de interceptores
+    const requestChain: any[] = [];
+    this.interceptors.request.forEach((interceptor) => {
+      requestChain.unshift(interceptor.fulfilled, interceptor.rejected);
+    });
+
+    const responseChain: any[] = [];
+    this.interceptors.response.forEach((interceptor) => {
+      responseChain.push(interceptor.fulfilled, interceptor.rejected);
+    });
+
+    let promise = Promise.resolve(initialConfig);
+
+    while (requestChain.length > 0) {
+      const fulfilled = requestChain.shift();
+      const rejected = requestChain.shift();
+      promise = promise.then(fulfilled, rejected);
+    }
+
+    let responsePromise = promise.then((finalConfig) => {
+      const fullUrl = this.buildUrl(finalConfig.url, finalConfig.params);
+
+      // Invalidador de mutaciones relacionado antes de despachar
+      if (finalConfig.method !== 'GET') {
+        this.cache.invalidateRelated(fullUrl);
+      }
+
+      const cacheTime = finalConfig.cacheTime ?? 0;
+      const useCache = finalConfig.method === 'GET' && cacheTime > 0;
+
+      if (useCache) {
+        const cacheKey = `${finalConfig.method}:${fullUrl}`;
+        const entry = this.cache.getEntry<T>(cacheKey);
+
+        if (entry) {
+          const now = Date.now();
+          const isFresh = now < entry.expiresAt;
+
+          if (isFresh) {
+            const cachedRes = {
+              ...entry.response,
+              headers: new Headers(entry.response.headers),
+            };
+            cachedRes.headers.set('X-Cache', 'HIT');
+            return cachedRes;
+          }
+
+          if (finalConfig.staleWhileRevalidate) {
+            this.triggerBackgroundRevalidate<T>(finalConfig, fullUrl, cacheKey, cacheTime);
+            const cachedRes = {
+              ...entry.response,
+              headers: new Headers(entry.response.headers),
+            };
+            cachedRes.headers.set('X-Cache', 'SWR-HIT');
+            return cachedRes;
+          }
+        }
+      }
+
+      const dispatch = () => {
+        if (finalConfig.dedupe) {
+          const key = `${finalConfig.method}:${fullUrl}`;
+          return this.deduplicator.execute(key, () => this.dispatchRequest<T>(finalConfig, fullUrl));
+        }
+        return this.dispatchRequest<T>(finalConfig, fullUrl);
+      };
+
+      if (useCache) {
+        const cacheKey = `${finalConfig.method}:${fullUrl}`;
+        return dispatch().then((res) => {
+          this.cache.set(cacheKey, res, cacheTime);
+          const cacheRes = {
+            ...res,
+            headers: new Headers(res.headers),
+          };
+          cacheRes.headers.set('X-Cache', 'MISS');
+          return cacheRes;
+        });
+      }
+
+      return dispatch();
+    });
+
+    while (responseChain.length > 0) {
+      const fulfilled = responseChain.shift();
+      const rejected = responseChain.shift();
+      responsePromise = responsePromise.then(fulfilled, rejected);
+    }
+
+    return responsePromise;
+  }
+
+  /**
+   * Ejecuta la petición en segundo plano para revalidar la caché.
+   * Silencia cualquier error para evitar interrumpir al cliente.
+   */
+  private triggerBackgroundRevalidate<T>(
+    config: InternalRequestConfig,
+    fullUrl: string,
+    cacheKey: string,
+    cacheTime: number
+  ): void {
+    const dispatch = () => {
+      if (config.dedupe) {
+        const key = `${config.method}:${fullUrl}`;
+        return this.deduplicator.execute(key, () => this.dispatchRequest<T>(config, fullUrl));
+      }
+      return this.dispatchRequest<T>(config, fullUrl);
+    };
+
+    dispatch()
+      .then((res) => {
+        this.cache.set(cacheKey, res, cacheTime);
+      })
+      .catch((err) => {
+        console.warn(`[SmartFetch Cache] Background revalidation failed for ${fullUrl}`, err);
+      });
+  }
+
+  /**
+   * Ejecuta la petición HTTP real combinando timeout y reintentos automáticos.
+   */
+  private async dispatchRequest<T>(
+    config: InternalRequestConfig,
+    fullUrl: string
+  ): Promise<SmartFetchResponse<T>> {
+    const headers = { ...config.headers };
+    const hasBody = config.body !== undefined && config.method !== 'GET' && config.method !== 'DELETE';
     if (hasBody && !headers['Content-Type']) {
       headers['Content-Type'] = 'application/json';
     }
 
     const executor = (signal: AbortSignal): Promise<Response> =>
       fetch(fullUrl, {
-        method,
+        method: config.method,
         headers,
         body: hasBody ? JSON.stringify(config.body) : undefined,
         signal,
@@ -134,7 +280,10 @@ export class SmartFetchClient {
 
     let response: Response;
     try {
-      response = await withRetry(() => withTimeout(executor, timeout), retries);
+      response = await withRetry(
+        () => withTimeout(executor, config.timeout ?? 0),
+        config.retries ?? 0
+      );
     } catch (error) {
       throw this.toSmartFetchError(error);
     }

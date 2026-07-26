@@ -8,6 +8,9 @@ export interface SmartFetchConfig {
   timeout?: number;
   retries?: number;
   headers?: Record<string, string>;
+  dedupe?: boolean;
+  cacheTime?: number;
+  staleWhileRevalidate?: boolean;
 }
 
 /**
@@ -20,6 +23,26 @@ export interface RequestConfig {
   headers?: Record<string, string>;
   params?: Record<string, string | number | boolean>;
   body?: unknown;
+  dedupe?: boolean;
+  cacheTime?: number;
+  staleWhileRevalidate?: boolean;
+}
+
+/**
+ * Estructura de un interceptor.
+ */
+export interface Interceptor<T> {
+  fulfilled?: (value: T) => T | Promise<T>;
+  rejected?: (error: any) => any;
+}
+
+/**
+ * Configuración interna de la petición pasada a los interceptores y dispatchRequest.
+ */
+export interface InternalRequestConfig extends RequestConfig {
+  url: string;
+  method: HttpMethod;
+  headers: Record<string, string>;
 }
 
 /**
