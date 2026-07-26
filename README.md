@@ -16,15 +16,19 @@ import { SmartFetchClient } from 'smartfetch';
 
 const client = new SmartFetchClient({
   baseURL: 'https://api.miapp.com',
-  timeout: 5000, // ms. 0 o ausente = sin límite
-  retries: 2,    // reintentos adicionales ante 5xx o errores de red
+  timeout: 5000,              // ms. 0 o ausente = sin límite
+  retries: 2,                 // reintentos adicionales ante 5xx o errores de red
   headers: { Authorization: 'Bearer token' },
+  dedupe: true,                // unificar GETs idénticos en vuelo (default: true en GET)
+  cacheTime: 0,                // ms de vida de la caché en memoria para GETs (default: sin caché)
+  staleWhileRevalidate: false, // servir caché vencida mientras se revalida en segundo plano
 });
 ```
 
-`baseURL`, `timeout`, `retries` y `headers` son opcionales y se pueden
-sobreescribir por petición pasando un segundo argumento de configuración a
-cualquiera de los métodos.
+`baseURL`, `timeout`, `retries`, `headers`, `dedupe`, `cacheTime` y
+`staleWhileRevalidate` son opcionales y se pueden sobreescribir por
+petición pasando un segundo argumento de configuración a cualquiera de los
+métodos.
 
 ## Uso
 
@@ -95,6 +99,73 @@ try {
 
 Solo se reintenta ante errores 5xx o de red; los errores 4xx se propagan de
 inmediato sin reintentos.
+
+### Interceptores
+
+Permiten inspeccionar o transformar cada petición antes de enviarse, y cada
+respuesta antes de llegar al llamador:
+
+```ts
+client.interceptors.request.use((config) => {
+  config.headers['Authorization'] = 'Bearer token';
+  return config;
+});
+
+const id = client.interceptors.response.use(
+  (response) => response,
+  (error) => Promise.reject(error)
+);
+
+client.interceptors.response.eject(id); // elimina el interceptor
+```
+
+`use()` devuelve un id numérico que se puede pasar a `eject()` para quitar
+ese interceptor puntual.
+
+### Deduplicación de peticiones (`dedupe`)
+
+Si se disparan varias peticiones `GET` idénticas (mismo método + URL) al
+mismo tiempo, SmartFetch une todas en una sola llamada real a `fetch` y
+reparte la misma respuesta entre quienes la pidieron:
+
+```ts
+const client = new SmartFetchClient({ dedupe: true }); // true por defecto en GET
+
+await Promise.all([
+  client.get('/posts/1'),
+  client.get('/posts/1'),
+  client.get('/posts/1'),
+]); // solo se dispara un fetch real
+```
+
+Se puede desactivar por cliente o por petición pasando `dedupe: false`.
+
+### Caché en memoria (`cacheTime`, `staleWhileRevalidate`)
+
+Las respuestas `GET` se pueden cachear en memoria por un tiempo determinado
+(TTL en milisegundos):
+
+```ts
+const client = new SmartFetchClient({ cacheTime: 5000 });
+
+await client.get('/posts/1'); // MISS: pega a la red
+await client.get('/posts/1'); // HIT: responde desde caché
+```
+
+Cada respuesta incluye el header `X-Cache` (`MISS`, `HIT` o `SWR-HIT`) para
+saber su origen.
+
+Con `staleWhileRevalidate: true`, al expirar el TTL se devuelve la versión
+obsoleta al instante mientras se revalida en segundo plano:
+
+```ts
+const client = new SmartFetchClient({ cacheTime: 5000, staleWhileRevalidate: true });
+```
+
+Cualquier petición de mutación (`POST`/`PUT`/`PATCH`/`DELETE`) invalida
+automáticamente la caché de esa ruta y de las rutas relacionadas (por
+ejemplo, mutar `/posts/1` invalida también `/posts`). También se puede
+limpiar manualmente con `client.cache.clear()`.
 
 ## Desarrollo
 
